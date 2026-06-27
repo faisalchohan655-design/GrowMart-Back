@@ -13,18 +13,28 @@ const Promotion = require('./models/Promotion');
 // ============ APP SETUP ============
 const app = express();
 const server = http.createServer(app);
+
+// ============ CORS SETUP (UPDATED) ============
+app.use(cors({
+  origin: '*', // Allow all origins for testing
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+}));
+
+// Handle preflight requests
+app.options('*', cors());
+
+// ============ SOCKET.IO (UPDATED) ============
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
+    origin: '*',
+    methods: ['GET', 'POST'],
+    credentials: true
   }
 });
 
 // ============ MIDDLEWARE ============
-app.use(cors({
-  origin: process.env.CLIENT_URL || '*',
-  credentials: true
-}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 

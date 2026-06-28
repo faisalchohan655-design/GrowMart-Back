@@ -109,16 +109,13 @@ const adminAuth = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Admin access required' });
     }
     
-    // For admin login, we don't need to check database
-    // But we can verify if user exists in DB (optional)
-    if (decoded.id) {
-      const user = await User.findById(decoded.id);
-      if (!user) {
-        return res.status(401).json({ success: false, message: 'User not found' });
-      }
-      req.user = user;
+    // Verify user in database
+    const user = await User.findById(decoded.id);
+    if (!user || user.role !== 'admin') {
+      return res.status(401).json({ success: false, message: 'Admin not found' });
     }
     
+    req.user = user;
     next();
   } catch (error) {
     res.status(401).json({ success: false, message: 'Invalid token' });
@@ -190,7 +187,7 @@ app.post('/api/auth/register', [
     const user = new User({ 
       name, 
       email, 
-      password: await bcrypt.hash(password, 10) 
+      password: password // Pre-save hook will hash it
     });
     await user.save();
 
@@ -225,7 +222,7 @@ app.post('/api/auth/login', [
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const isMatch = await bcrypt.compare(password, user.password);
+    const isMatch = await user.comparePassword(password);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
@@ -243,7 +240,12 @@ app.post('/api/auth/login', [
   }
 });
 
-// ============ ✅ ADMIN AUTH ROUTE (NEW) ============
+// Get current user
+app.get('/api/auth/me', auth, async (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+// ============ ✅ ADMIN AUTH ROUTE ============
 app.post('/api/admin/login', [
   body('email').isEmail().withMessage('Valid email is required'),
   body('password').notEmpty().withMessage('Password is required')
@@ -256,10 +258,10 @@ app.post('/api/admin/login', [
 
     const { email, password } = req.body;
     
-    // Check if admin exists in database
+    // Find admin user
     const admin = await User.findOne({ 
-      email: email,
-      role: 'admin'  // Only allow users with 'admin' role
+      email: email.toLowerCase(),
+      role: 'admin'
     });
     
     if (!admin) {
@@ -269,8 +271,8 @@ app.post('/api/admin/login', [
       });
     }
 
-    // Verify password
-    const isMatch = await bcrypt.compare(password, admin.password);
+    // Verify password using comparePassword method
+    const isMatch = await admin.comparePassword(password);
     if (!isMatch) {
       return res.status(401).json({ 
         success: false, 
@@ -310,13 +312,18 @@ app.post('/api/admin/login', [
   }
 });
 
-// ============ ✅ PROTECTED ADMIN ROUTES ============
+// ============ ✅ ADMIN PROTECTED ROUTES ============
 
 // Get current admin
 app.get('/api/admin/me', adminAuth, async (req, res) => {
   res.json({ 
     success: true, 
-    admin: req.user 
+    admin: {
+      id: req.user._id,
+      name: req.user.name,
+      email: req.user.email,
+      role: req.user.role
+    }
   });
 });
 
@@ -410,13 +417,6 @@ app.get('/api/admin/analytics', adminAuth, async (req, res) => {
   }
 });
 
-// ============ EXISTING ROUTES (Keep as they are) ============
-
-// Get current user
-app.get('/api/auth/me', auth, async (req, res) => {
-  res.json({ success: true, user: req.user });
-});
-
 // ============ STRIPE PAYMENT ============
 
 app.post('/api/create-payment-intent', auth, async (req, res) => {
@@ -442,7 +442,7 @@ app.post('/api/create-payment-intent', auth, async (req, res) => {
   }
 });
 
-// ============ ORDER ROUTES (Public/User) ============
+// ============ ORDER ROUTES ============
 
 app.post('/api/orders', auth, async (req, res) => {
   try {
@@ -503,7 +503,7 @@ app.get('/api/orders', auth, async (req, res) => {
   }
 });
 
-// ============ PRODUCT ROUTES (Public) ============
+// ============ PRODUCT ROUTES ============
 
 app.get('/api/products', async (req, res) => {
   try {
@@ -531,7 +531,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-// ============ ANALYTICS (Public/User) ============
+// ============ ANALYTICS (Public) ============
 
 app.get('/api/analytics', auth, async (req, res) => {
   try {

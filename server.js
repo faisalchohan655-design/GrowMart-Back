@@ -137,7 +137,7 @@ const sendOrderStatusUpdate = async (order) => {
 
 // ============ AUTH ROUTES ============
 
-// Register
+// ✅ Register - Fixed
 app.post('/api/auth/register', [
   body('name').notEmpty().withMessage('Name is required'),
   body('email').isEmail().withMessage('Valid email is required'),
@@ -150,27 +150,36 @@ app.post('/api/auth/register', [
     }
 
     const { name, email, password } = req.body;
+    
+    // Check if user exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    const user = new User({ name, email, password });
+    // Create user with hashed password
+    const user = new User({ 
+      name, 
+      email, 
+      password: await bcrypt.hash(password, 10) 
+    });
     await user.save();
 
+    // Generate token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     res.status(201).json({
       success: true,
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+      user: { id: user._id, name: user.name, email: user.email, role: user.role || 'user' }
     });
   } catch (error) {
+    console.error('Register error:', error);
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
 
-// Login
+// ✅ Login - Fixed
 app.post('/api/auth/login', [
   body('email').isEmail().withMessage('Valid email is required'),
   body('password').notEmpty().withMessage('Password is required')
@@ -182,24 +191,29 @@ app.post('/api/auth/login', [
     }
 
     const { email, password } = req.body;
+    
+    // Find user
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    const isMatch = await user.comparePassword(password);
+    // ✅ Compare password correctly
+    const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
+    // Generate token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     res.json({
       success: true,
       token,
-      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+      user: { id: user._id, name: user.name, email: user.email, role: user.role || 'user' }
     });
   } catch (error) {
+    console.error('Login error:', error);
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });

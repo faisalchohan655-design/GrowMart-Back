@@ -94,7 +94,7 @@ const auth = async (req, res, next) => {
   }
 };
 
-// ============ ADMIN AUTH MIDDLEWARE ============
+// ============ ADMIN AUTH MIDDLEWARE (SIMPLE - NO DB) ============
 const adminAuth = async (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -109,13 +109,6 @@ const adminAuth = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Admin access required' });
     }
     
-    // Verify user in database
-    const user = await User.findById(decoded.id);
-    if (!user || user.role !== 'admin') {
-      return res.status(401).json({ success: false, message: 'Admin not found' });
-    }
-    
-    req.user = user;
     next();
   } catch (error) {
     res.status(401).json({ success: false, message: 'Invalid token' });
@@ -187,7 +180,7 @@ app.post('/api/auth/register', [
     const user = new User({ 
       name, 
       email, 
-      password: password // Pre-save hook will hash it
+      password: password
     });
     await user.save();
 
@@ -245,63 +238,44 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
-// ============ ✅ ADMIN AUTH ROUTE ============
-app.post('/api/admin/login', [
-  body('email').isEmail().withMessage('Valid email is required'),
-  body('password').notEmpty().withMessage('Password is required')
-], async (req, res) => {
+// ============ ✅ ADMIN LOGIN - SIMPLE (NO DATABASE REQUIRED!) ============
+app.post('/api/admin/login', (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ success: false, errors: errors.array() });
-    }
-
     const { email, password } = req.body;
     
-    // Find admin user
-    const admin = await User.findOne({ 
-      email: email.toLowerCase(),
-      role: 'admin'
+    // ✅ SUPER SIMPLE - Hardcoded credentials
+    const ADMIN_EMAIL = 'admin@growmart.com';
+    const ADMIN_PASSWORD = 'growmart2025';
+    
+    if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+      // Generate token
+      const token = jwt.sign(
+        { 
+          email: ADMIN_EMAIL,
+          isAdmin: true,
+          role: 'admin'
+        }, 
+        process.env.JWT_SECRET, 
+        { expiresIn: '24h' }
+      );
+
+      return res.json({
+        success: true,
+        token,
+        admin: {
+          id: 'admin_001',
+          name: 'Admin',
+          email: ADMIN_EMAIL,
+          role: 'admin'
+        }
+      });
+    }
+    
+    return res.status(401).json({ 
+      success: false, 
+      message: 'Invalid admin credentials' 
     });
     
-    if (!admin) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Invalid admin credentials' 
-      });
-    }
-
-    // Verify password using comparePassword method
-    const isMatch = await admin.comparePassword(password);
-    if (!isMatch) {
-      return res.status(401).json({ 
-        success: false, 
-        message: 'Invalid admin credentials' 
-      });
-    }
-
-    // Generate admin token with isAdmin flag
-    const token = jwt.sign(
-      { 
-        id: admin._id, 
-        email: admin.email,
-        isAdmin: true,
-        role: 'admin'
-      }, 
-      process.env.JWT_SECRET, 
-      { expiresIn: '24h' }
-    );
-
-    res.json({
-      success: true,
-      token,
-      admin: {
-        id: admin._id,
-        name: admin.name,
-        email: admin.email,
-        role: admin.role
-      }
-    });
   } catch (error) {
     console.error('Admin login error:', error);
     res.status(500).json({ 
@@ -315,14 +289,14 @@ app.post('/api/admin/login', [
 // ============ ✅ ADMIN PROTECTED ROUTES ============
 
 // Get current admin
-app.get('/api/admin/me', adminAuth, async (req, res) => {
+app.get('/api/admin/me', adminAuth, (req, res) => {
   res.json({ 
     success: true, 
     admin: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      role: req.user.role
+      id: 'admin_001',
+      name: 'Admin',
+      email: 'admin@growmart.com',
+      role: 'admin'
     }
   });
 });
@@ -351,7 +325,6 @@ app.put('/api/admin/orders/:id', adminAuth, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Order not found' });
     }
 
-    // Send status update email
     await sendOrderStatusUpdate(order);
 
     res.json({ success: true, data: order });

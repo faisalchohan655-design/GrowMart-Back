@@ -4,264 +4,325 @@ const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+const { Resend } = require('resend');
+const { body, validationResult } = require('express-validator');
 
-// Import Models
+// ============ Import Models ============
+const User = require('./models/User');
 const Product = require('./models/Product');
 const Order = require('./models/Order');
-const Promotion = require('./models/Promotion');
 
 // ============ APP SETUP ============
 const app = express();
 const server = http.createServer(app);
-
-// ============ CORS SETUP (UPDATED) ============
-app.use(cors({
-  origin: '*', // Allow all origins for testing
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
-}));
-
-// Handle preflight requests
-app.options('*', cors());
-
-// ============ SOCKET.IO (UPDATED) ============
 const io = new Server(server, {
   cors: {
     origin: '*',
-    methods: ['GET', 'POST'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE'],
     credentials: true
   }
 });
 
 // ============ MIDDLEWARE ============
+app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// ============ DATABASE CONNECTION ============
+// ============ DATABASE ============
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('✅ MongoDB Connected Successfully'))
-  .catch(err => {
-    console.error('❌ MongoDB Connection Error:', err.message);
-    process.exit(1);
-  });
+  .then(() => console.log('✅ MongoDB Connected'))
+  .catch(err => console.error('❌ MongoDB Error:', err));
 
-// ============ SOCKET.IO - REAL-TIME FEATURES ============
+// ============ RESEND EMAIL SETUP ============
+const resend = new Resend(process.env.RESEND_API_KEY);
 
-// Store active users
+const sendEmail = async (to, subject, html) => {
+  try {
+    const { data, error } = await resend.emails.send({
+      from: process.env.EMAIL_USER || 'onboarding@resend.dev',
+      to: to,
+      subject: subject,
+      html: html
+    });
+    if (error) throw error;
+    console.log('📧 Email sent to:', to);
+    return data;
+  } catch (error) {
+    console.error('Email error:', error);
+    throw error;
+  }
+};
+
+// ============ SOCKET.IO ============
 const activeUsers = new Map();
-const chatMessages = [];
-const MAX_CHAT_MESSAGES = 100;
 
 io.on('connection', (socket) => {
-  console.log(`🟢 New connection: ${socket.id}`);
-
-  // --- 1. LIVE VISITORS ---
-  activeUsers.set(socket.id, { 
-    joinedAt: new Date(),
-    userAgent: socket.handshake.headers['user-agent'] || 'Unknown'
-  });
+  console.log('🟢 New connection:', socket.id);
+  activeUsers.set(socket.id, { joinedAt: new Date() });
   io.emit('visitors', activeUsers.size);
-  io.emit('user-joined', { 
-    id: socket.id, 
-    total: activeUsers.size 
-  });
 
-  // --- 2. LIVE CHAT ---
-  socket.on('chat-message', (data) => {
-    if (!data.message || data.message.trim() === '') return;
-    
-    const messageData = {
-      id: Date.now(),
-      userId: socket.id,
-      message: data.message.trim(),
-      timestamp: new Date(),
-      type: 'user'
-    };
-    
-    chatMessages.push(messageData);
-    if (chatMessages.length > MAX_CHAT_MESSAGES) {
-      chatMessages.shift();
-    }
-    
-    // Broadcast to all users
-    io.emit('chat-reply', messageData);
-    
-    // Auto-reply after 1.5 seconds
-    setTimeout(() => {
-      const autoReplies = [
-        "Thanks for your message! I'll get back to you shortly.",
-        "Great question! Let me check that for you.",
-        "I appreciate your interest in our products!",
-        "Thank you for reaching out! How can I assist you today?",
-        "That's a good point. Let me help you with that."
-      ];
-      const autoReply = {
-        id: Date.now() + 1,
-        userId: 'system',
-        message: autoReplies[Math.floor(Math.random() * autoReplies.length)],
-        timestamp: new Date(),
-        type: 'system'
-      };
-      chatMessages.push(autoReply);
-      io.emit('chat-reply', autoReply);
-    }, 1500);
-  });
-
-  // --- 3. TYPING INDICATOR ---
-  socket.on('typing-start', () => {
-    socket.broadcast.emit('typing-indicator', {
-      userId: socket.id,
-      isTyping: true
-    });
-  });
-
-  socket.on('typing-end', () => {
-    socket.broadcast.emit('typing-indicator', {
-      userId: socket.id,
-      isTyping: false
-    });
-  });
-
-  // --- 4. NEW ORDER ---
-  socket.on('new-order', async (orderData) => {
-    try {
-      // Validate order data
-      if (!orderData.customer || !orderData.items || orderData.items.length === 0) {
-        socket.emit('order-error', { message: 'Invalid order data' });
-        return;
-      }
-
-      const order = new Order(orderData);
-      await order.save();
-
-      // Emit to all connected clients
-      io.emit('order-notification', {
-        orderId: order.orderId,
-        customer: order.customer.name,
-        total: order.total,
-        timestamp: new Date()
-      });
-
-      // Admin alert
-      io.emit('admin-alert', {
-        type: 'new-order',
-        message: `🎉 New order #${order.orderId} from ${order.customer.name}`,
-        data: order
-      });
-
-      // Confirmation to customer
-      socket.emit('order-confirmation', {
-        orderId: order.orderId,
-        status: 'confirmed',
-        estimatedDelivery: '3-5 business days'
-      });
-
-      console.log(`📦 New order created: ${order.orderId}`);
-
-    } catch (error) {
-      console.error('Order error:', error.message);
-      socket.emit('order-error', { 
-        message: error.message || 'Failed to place order' 
-      });
-    }
-  });
-
-  // --- 5. FLASH SALE ---
-  socket.on('flash-sale-start', (saleData) => {
-    io.emit('flash-sale-alert', {
-      message: saleData.message || '⚡ FLASH SALE! Limited time offer!',
-      discount: saleData.discount || 50,
-      products: saleData.products || [],
-      timer: saleData.duration || 3600,
-      startTime: new Date()
-    });
-  });
-
-  // --- 6. REAL-TIME ANALYTICS ---
-  socket.on('analytics-request', async () => {
-    try {
-      const totalOrders = await Order.countDocuments();
-      const totalRevenue = await Order.aggregate([
-        { $group: { _id: null, total: { $sum: '$total' } } }
-      ]);
-      const recentOrders = await Order.find()
-        .sort({ createdAt: -1 })
-        .limit(5);
-
-      socket.emit('analytics-data', {
-        visitors: activeUsers.size,
-        orders: totalOrders,
-        revenue: totalRevenue[0]?.total || 0,
-        recentOrders: recentOrders,
-        timestamp: new Date()
-      });
-    } catch (error) {
-      socket.emit('analytics-error', { 
-        message: 'Failed to fetch analytics' 
-      });
-    }
-  });
-
-  // --- 7. DISCONNECT ---
   socket.on('disconnect', () => {
     activeUsers.delete(socket.id);
     io.emit('visitors', activeUsers.size);
-    io.emit('user-left', { 
-      id: socket.id, 
-      total: activeUsers.size 
-    });
-    console.log(`🔴 User disconnected: ${socket.id}`);
+    console.log('🔴 User disconnected:', socket.id);
+  });
+
+  socket.on('new-order', (order) => {
+    io.emit('order-notification', order);
   });
 });
 
-// ============ API ROUTES ============
+// ============ AUTH MIDDLEWARE ============
+const auth = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ message: 'Authentication required' });
+    }
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(decoded.id).select('-password');
+    if (!user) {
+      return res.status(401).json({ message: 'User not found' });
+    }
+    req.user = user;
+    next();
+  } catch (error) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+};
 
-// --- PRODUCTS ---
+// ============ EMAIL FUNCTIONS ============
+const sendOrderConfirmation = async (order, user) => {
+  const itemsHtml = order.items.map(item => `
+    <tr>
+      <td>${item.name}</td>
+      <td>$${item.price}</td>
+      <td>${item.quantity}</td>
+      <td>$${(item.price * item.quantity).toFixed(2)}</td>
+    </tr>
+  `).join('');
+
+  const html = `
+    <h1>🎉 Order Confirmed!</h1>
+    <p>Hi ${user.name || order.customer.name},</p>
+    <p>Thank you for your order! We're processing it now.</p>
+    <h2>Order #${order.orderId}</h2>
+    <table border="1" cellpadding="5">
+      <tr><th>Product</th><th>Price</th><th>Qty</th><th>Total</th></tr>
+      ${itemsHtml}
+      <tr><td colspan="3"><strong>Total:</strong></td><td><strong>$${order.total}</strong></td></tr>
+    </table>
+    <p>Shipping to: ${order.shippingAddress.street}, ${order.shippingAddress.city}</p>
+    <p>Estimated delivery: 3-5 business days</p>
+    <br/>
+    <p>Thanks for shopping with GrowMart! 🌱</p>
+  `;
+  
+  await sendEmail(order.customer.email, `Order #${order.orderId} Confirmed! 🎉`, html);
+};
+
+const sendOrderStatusUpdate = async (order) => {
+  const html = `
+    <h1>📦 Order Update</h1>
+    <p>Your order #${order.orderId} status has been updated to: <strong>${order.status}</strong></p>
+    <p>Track your order: ${process.env.CLIENT_URL}/track/${order.orderId}</p>
+    <br/>
+    <p>Thanks for shopping with GrowMart! 🌱</p>
+  `;
+  await sendEmail(order.customer.email, `Order #${order.orderId} - ${order.status}`, html);
+};
+
+// ============ AUTH ROUTES ============
+
+// Register
+app.post('/api/auth/register', [
+  body('name').notEmpty().withMessage('Name is required'),
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { name, email, password } = req.body;
+    const existingUser = await User.findOne({ email });
+    if (existingUser) {
+      return res.status(400).json({ message: 'User already exists' });
+    }
+
+    const user = new User({ name, email, password });
+    await user.save();
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+    res.status(201).json({
+      success: true,
+      token,
+      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Login
+app.post('/api/auth/login', [
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').notEmpty().withMessage('Password is required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const { email, password } = req.body;
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const isMatch = await user.comparePassword(password);
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({
+      success: true,
+      token,
+      user: { id: user._id, name: user.name, email: user.email, role: user.role }
+    });
+  } catch (error) {
+    res.status(500).json({ message: 'Server error', error: error.message });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', auth, async (req, res) => {
+  res.json({ success: true, user: req.user });
+});
+
+// ============ STRIPE PAYMENT ============
+
+app.post('/api/create-payment-intent', auth, async (req, res) => {
+  try {
+    const { amount, currency = 'usd' } = req.body;
+    
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(amount * 100),
+      currency: currency,
+      metadata: {
+        userId: req.user._id.toString(),
+        email: req.user.email
+      }
+    });
+
+    res.json({
+      success: true,
+      clientSecret: paymentIntent.client_secret,
+      paymentIntentId: paymentIntent.id
+    });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// ============ ORDER ROUTES ============
+
+app.post('/api/orders', auth, async (req, res) => {
+  try {
+    const orderData = {
+      ...req.body,
+      userId: req.user._id,
+      customer: {
+        name: req.user.name,
+        email: req.user.email,
+        phone: req.body.customer?.phone || ''
+      }
+    };
+
+    const order = new Order(orderData);
+    await order.save();
+
+    // Send email confirmation
+    await sendOrderConfirmation(order, req.user);
+
+    // Emit via Socket.IO
+    io.emit('order-notification', {
+      orderId: order.orderId,
+      customer: order.customer.name,
+      total: order.total
+    });
+
+    res.status(201).json({ success: true, data: order });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.put('/api/orders/:id/status', auth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true }
+    );
+    
+    if (!order) {
+      return res.status(404).json({ message: 'Order not found' });
+    }
+
+    // Send status update email
+    await sendOrderStatusUpdate(order);
+
+    res.json({ success: true, data: order });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/orders', auth, async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+    res.json({ success: true, data: orders });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============ PRODUCT ROUTES ============
+
 app.get('/api/products', async (req, res) => {
   try {
     const { category, featured, sale, search } = req.query;
     const filter = {};
-    
     if (category) filter.category = category;
     if (featured) filter.isFeatured = featured === 'true';
     if (sale) filter.isOnSale = sale === 'true';
-    if (search) {
-      filter.name = { $regex: search, $options: 'i' };
-    }
+    if (search) filter.name = { $regex: search, $options: 'i' };
     
     const products = await Product.find(filter).sort({ createdAt: -1 });
-    res.json({
-      success: true,
-      count: products.length,
-      data: products
-    });
+    res.json({ success: true, count: products.length, data: products });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.get('/api/products/:id', async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
-    if (!product) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Product not found' 
-      });
-    }
-    res.json({
-      success: true,
-      data: product
-    });
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    res.json({ success: true, data: product });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
@@ -269,276 +330,62 @@ app.post('/api/products', async (req, res) => {
   try {
     const product = new Product(req.body);
     await product.save();
-    
-    // Emit via Socket.IO
     io.emit('product-added', product);
-    
-    res.status(201).json({
-      success: true,
-      data: product
-    });
+    res.status(201).json({ success: true, data: product });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-app.put('/api/products/:id', async (req, res) => {
-  try {
-    const product = await Product.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true, runValidators: true }
-    );
-    if (!product) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Product not found' 
-      });
-    }
-    
-    // Emit via Socket.IO
-    io.emit('product-updated', product);
-    
-    res.json({
-      success: true,
-      data: product
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
 app.delete('/api/products/:id', async (req, res) => {
   try {
-    const product = await Product.findByIdAndDelete(req.params.id);
-    if (!product) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Product not found' 
-      });
-    }
-    
-    // Emit via Socket.IO
+    await Product.findByIdAndDelete(req.params.id);
     io.emit('product-deleted', { id: req.params.id });
-    
-    res.json({
-      success: true,
-      message: 'Product deleted successfully'
-    });
+    res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// --- ORDERS ---
-app.get('/api/orders', async (req, res) => {
-  try {
-    const orders = await Order.find()
-      .sort({ createdAt: -1 });
-    res.json({
-      success: true,
-      count: orders.length,
-      data: orders
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
+// ============ ANALYTICS ============
 
-app.get('/api/orders/:id', async (req, res) => {
-  try {
-    const order = await Order.findOne({ orderId: req.params.id });
-    if (!order) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Order not found' 
-      });
-    }
-    res.json({
-      success: true,
-      data: order
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-app.post('/api/orders', async (req, res) => {
-  try {
-    const order = new Order(req.body);
-    await order.save();
-    
-    // Emit via Socket.IO
-    io.emit('order-notification', {
-      orderId: order.orderId,
-      customer: order.customer.name,
-      total: order.total,
-      timestamp: new Date()
-    });
-    
-    res.status(201).json({
-      success: true,
-      data: order
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-app.put('/api/orders/:id', async (req, res) => {
-  try {
-    const order = await Order.findByIdAndUpdate(
-      req.params.id,
-      { status: req.body.status },
-      { new: true }
-    );
-    if (!order) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Order not found' 
-      });
-    }
-    
-    // Emit via Socket.IO
-    io.emit('order-status-updated', order);
-    
-    res.json({
-      success: true,
-      data: order
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-// --- PROMOTIONS ---
-app.get('/api/promotions', async (req, res) => {
-  try {
-    const promotions = await Promotion.find({ isActive: true })
-      .sort({ createdAt: -1 });
-    res.json({
-      success: true,
-      count: promotions.length,
-      data: promotions
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-app.post('/api/promotions', async (req, res) => {
-  try {
-    const promotion = new Promotion(req.body);
-    await promotion.save();
-    
-    // Emit via Socket.IO
-    io.emit('promotion-created', promotion);
-    
-    res.status(201).json({
-      success: true,
-      data: promotion
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-app.put('/api/promotions/:id', async (req, res) => {
-  try {
-    const promotion = await Promotion.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true }
-    );
-    if (!promotion) {
-      return res.status(404).json({ 
-        success: false, 
-        message: 'Promotion not found' 
-      });
-    }
-    res.json({
-      success: true,
-      data: promotion
-    });
-  } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
-  }
-});
-
-// --- ANALYTICS ---
-app.get('/api/analytics', async (req, res) => {
+app.get('/api/analytics', auth, async (req, res) => {
   try {
     const totalOrders = await Order.countDocuments();
     const totalRevenue = await Order.aggregate([
       { $group: { _id: null, total: { $sum: '$total' } } }
     ]);
-    const recentOrders = await Order.find()
-      .sort({ createdAt: -1 })
-      .limit(5);
     const totalProducts = await Product.countDocuments();
+    const recentOrders = await Order.find().sort({ createdAt: -1 }).limit(5);
 
     res.json({
       success: true,
       data: {
-        visitors: activeUsers.size,
         orders: totalOrders,
         revenue: totalRevenue[0]?.total || 0,
         products: totalProducts,
-        recentOrders: recentOrders,
-        timestamp: new Date()
+        recentOrders
       }
     });
   } catch (error) {
-    res.status(500).json({ 
-      success: false, 
-      message: error.message 
-    });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// --- HEALTH CHECK ---
+// ============ HEALTH CHECK ============
+
 app.get('/api/health', (req, res) => {
   res.json({
     success: true,
     status: 'ok',
     message: '🚀 GrowMart API is running',
-    activeConnections: activeUsers.size,
-    timestamp: new Date(),
-    uptime: process.uptime()
+    uptime: process.uptime(),
+    timestamp: new Date()
   });
 });
 
-// --- 404 HANDLER ---
+// ============ 404 HANDLER ============
+
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -546,7 +393,8 @@ app.use((req, res) => {
   });
 });
 
-// --- ERROR HANDLER ---
+// ============ ERROR HANDLER ============
+
 app.use((err, req, res, next) => {
   console.error('Error:', err.stack);
   res.status(500).json({
@@ -556,9 +404,10 @@ app.use((err, req, res, next) => {
 });
 
 // ============ START SERVER ============
+
 const PORT = process.env.PORT || 5000;
 server.listen(PORT, () => {
-  console.log(`🚀 GrowMart Server running on port ${PORT}`);
+  console.log(`🚀 Server running on port ${PORT}`);
   console.log(`📊 API: http://localhost:${PORT}/api`);
   console.log(`🔌 Socket.IO: ws://localhost:${PORT}`);
   console.log(`✅ Environment: ${process.env.NODE_ENV || 'development'}`);

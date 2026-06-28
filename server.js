@@ -94,6 +94,37 @@ const auth = async (req, res, next) => {
   }
 };
 
+// ============ ADMIN AUTH MIDDLEWARE ============
+const adminAuth = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'Authentication required' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Check if user is admin
+    if (!decoded.isAdmin) {
+      return res.status(403).json({ success: false, message: 'Admin access required' });
+    }
+    
+    // For admin login, we don't need to check database
+    // But we can verify if user exists in DB (optional)
+    if (decoded.id) {
+      const user = await User.findById(decoded.id);
+      if (!user) {
+        return res.status(401).json({ success: false, message: 'User not found' });
+      }
+      req.user = user;
+    }
+    
+    next();
+  } catch (error) {
+    res.status(401).json({ success: false, message: 'Invalid token' });
+  }
+};
+
 // ============ EMAIL FUNCTIONS ============
 const sendOrderConfirmation = async (order, user) => {
   const itemsHtml = order.items.map(item => `
@@ -137,7 +168,7 @@ const sendOrderStatusUpdate = async (order) => {
 
 // ============ AUTH ROUTES ============
 
-// ✅ Register - Fixed
+// ✅ Register
 app.post('/api/auth/register', [
   body('name').notEmpty().withMessage('Name is required'),
   body('email').isEmail().withMessage('Valid email is required'),
@@ -151,13 +182,11 @@ app.post('/api/auth/register', [
 
     const { name, email, password } = req.body;
     
-    // Check if user exists
     const existingUser = await User.findOne({ email });
     if (existingUser) {
       return res.status(400).json({ message: 'User already exists' });
     }
 
-    // Create user with hashed password
     const user = new User({ 
       name, 
       email, 
@@ -165,7 +194,6 @@ app.post('/api/auth/register', [
     });
     await user.save();
 
-    // Generate token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     res.status(201).json({
@@ -179,7 +207,7 @@ app.post('/api/auth/register', [
   }
 });
 
-// ✅ Login - Fixed
+// ✅ Login
 app.post('/api/auth/login', [
   body('email').isEmail().withMessage('Valid email is required'),
   body('password').notEmpty().withMessage('Password is required')
@@ -192,19 +220,16 @@ app.post('/api/auth/login', [
 
     const { email, password } = req.body;
     
-    // Find user
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // ✅ Compare password correctly
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ message: 'Invalid credentials' });
     }
 
-    // Generate token
     const token = jwt.sign({ id: user._id }, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     res.json({
@@ -217,6 +242,175 @@ app.post('/api/auth/login', [
     res.status(500).json({ message: 'Server error', error: error.message });
   }
 });
+
+// ============ ✅ ADMIN AUTH ROUTE (NEW) ============
+app.post('/api/admin/login', [
+  body('email').isEmail().withMessage('Valid email is required'),
+  body('password').notEmpty().withMessage('Password is required')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ success: false, errors: errors.array() });
+    }
+
+    const { email, password } = req.body;
+    
+    // Check if admin exists in database
+    const admin = await User.findOne({ 
+      email: email,
+      role: 'admin'  // Only allow users with 'admin' role
+    });
+    
+    if (!admin) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid admin credentials' 
+      });
+    }
+
+    // Verify password
+    const isMatch = await bcrypt.compare(password, admin.password);
+    if (!isMatch) {
+      return res.status(401).json({ 
+        success: false, 
+        message: 'Invalid admin credentials' 
+      });
+    }
+
+    // Generate admin token with isAdmin flag
+    const token = jwt.sign(
+      { 
+        id: admin._id, 
+        email: admin.email,
+        isAdmin: true,
+        role: 'admin'
+      }, 
+      process.env.JWT_SECRET, 
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      success: true,
+      token,
+      admin: {
+        id: admin._id,
+        name: admin.name,
+        email: admin.email,
+        role: admin.role
+      }
+    });
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error', 
+      error: error.message 
+    });
+  }
+});
+
+// ============ ✅ PROTECTED ADMIN ROUTES ============
+
+// Get current admin
+app.get('/api/admin/me', adminAuth, async (req, res) => {
+  res.json({ 
+    success: true, 
+    admin: req.user 
+  });
+});
+
+// Get all orders (admin only)
+app.get('/api/admin/orders', adminAuth, async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+    res.json({ success: true, data: orders });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update order status (admin only)
+app.put('/api/admin/orders/:id', adminAuth, async (req, res) => {
+  try {
+    const { status } = req.body;
+    const order = await Order.findByIdAndUpdate(
+      req.params.id,
+      { status },
+      { new: true }
+    );
+    
+    if (!order) {
+      return res.status(404).json({ success: false, message: 'Order not found' });
+    }
+
+    // Send status update email
+    await sendOrderStatusUpdate(order);
+
+    res.json({ success: true, data: order });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get all products (admin only)
+app.get('/api/admin/products', adminAuth, async (req, res) => {
+  try {
+    const products = await Product.find().sort({ createdAt: -1 });
+    res.json({ success: true, data: products });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Add product (admin only)
+app.post('/api/admin/products', adminAuth, async (req, res) => {
+  try {
+    const product = new Product(req.body);
+    await product.save();
+    io.emit('product-added', product);
+    res.status(201).json({ success: true, data: product });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete product (admin only)
+app.delete('/api/admin/products/:id', adminAuth, async (req, res) => {
+  try {
+    await Product.findByIdAndDelete(req.params.id);
+    io.emit('product-deleted', { id: req.params.id });
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get analytics (admin only)
+app.get('/api/admin/analytics', adminAuth, async (req, res) => {
+  try {
+    const totalOrders = await Order.countDocuments();
+    const totalRevenue = await Order.aggregate([
+      { $group: { _id: null, total: { $sum: '$total' } } }
+    ]);
+    const totalProducts = await Product.countDocuments();
+    const recentOrders = await Order.find().sort({ createdAt: -1 }).limit(5);
+
+    res.json({
+      success: true,
+      data: {
+        orders: totalOrders,
+        revenue: totalRevenue[0]?.total || 0,
+        products: totalProducts,
+        recentOrders
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============ EXISTING ROUTES (Keep as they are) ============
 
 // Get current user
 app.get('/api/auth/me', auth, async (req, res) => {
@@ -248,7 +442,7 @@ app.post('/api/create-payment-intent', auth, async (req, res) => {
   }
 });
 
-// ============ ORDER ROUTES ============
+// ============ ORDER ROUTES (Public/User) ============
 
 app.post('/api/orders', auth, async (req, res) => {
   try {
@@ -265,10 +459,8 @@ app.post('/api/orders', auth, async (req, res) => {
     const order = new Order(orderData);
     await order.save();
 
-    // Send email confirmation
     await sendOrderConfirmation(order, req.user);
 
-    // Emit via Socket.IO
     io.emit('order-notification', {
       orderId: order.orderId,
       customer: order.customer.name,
@@ -294,7 +486,6 @@ app.put('/api/orders/:id/status', auth, async (req, res) => {
       return res.status(404).json({ message: 'Order not found' });
     }
 
-    // Send status update email
     await sendOrderStatusUpdate(order);
 
     res.json({ success: true, data: order });
@@ -312,7 +503,7 @@ app.get('/api/orders', auth, async (req, res) => {
   }
 });
 
-// ============ PRODUCT ROUTES ============
+// ============ PRODUCT ROUTES (Public) ============
 
 app.get('/api/products', async (req, res) => {
   try {
@@ -340,28 +531,7 @@ app.get('/api/products/:id', async (req, res) => {
   }
 });
 
-app.post('/api/products', async (req, res) => {
-  try {
-    const product = new Product(req.body);
-    await product.save();
-    io.emit('product-added', product);
-    res.status(201).json({ success: true, data: product });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.delete('/api/products/:id', async (req, res) => {
-  try {
-    await Product.findByIdAndDelete(req.params.id);
-    io.emit('product-deleted', { id: req.params.id });
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============ ANALYTICS ============
+// ============ ANALYTICS (Public/User) ============
 
 app.get('/api/analytics', auth, async (req, res) => {
   try {

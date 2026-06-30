@@ -58,11 +58,36 @@ const sendEmail = async (to, subject, html) => {
 
 // ============ SOCKET.IO ============
 const activeUsers = new Map();
+const chatMessages = [];
 
 io.on('connection', (socket) => {
   console.log('🟢 New connection:', socket.id);
   activeUsers.set(socket.id, { joinedAt: new Date() });
   io.emit('visitors', activeUsers.size);
+
+  // ============ LIVE CHAT ============
+  // Send chat history to new user
+  socket.emit('chat-history', chatMessages);
+
+  // Handle new chat message
+  socket.on('chat-message', (data) => {
+    const message = {
+      id: Date.now(),
+      userId: socket.id,
+      username: data.username || 'User',
+      message: data.message,
+      timestamp: new Date().toISOString()
+    };
+    chatMessages.push(message);
+    // Keep only last 100 messages
+    if (chatMessages.length > 100) chatMessages.shift();
+    io.emit('chat-message', message);
+  });
+
+  // Typing indicator
+  socket.on('typing', (data) => {
+    socket.broadcast.emit('typing', { userId: socket.id, username: data.username });
+  });
 
   socket.on('disconnect', () => {
     activeUsers.delete(socket.id);
@@ -94,7 +119,7 @@ const auth = async (req, res, next) => {
   }
 };
 
-// ============ ADMIN AUTH MIDDLEWARE (SIMPLE - NO DB) ============
+// ============ ADMIN AUTH MIDDLEWARE ============
 const adminAuth = async (req, res, next) => {
   try {
     const token = req.header('Authorization')?.replace('Bearer ', '');
@@ -103,8 +128,6 @@ const adminAuth = async (req, res, next) => {
     }
     
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    
-    // Check if user is admin
     if (!decoded.isAdmin) {
       return res.status(403).json({ success: false, message: 'Admin access required' });
     }
@@ -238,24 +261,18 @@ app.get('/api/auth/me', auth, async (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
-// ============ ✅ ADMIN LOGIN - SIMPLE (NO DATABASE REQUIRED!) ============
+// ============ ✅ ADMIN LOGIN - SIMPLE ============
 app.post('/api/admin/login', (req, res) => {
   try {
     const { email, password } = req.body;
     
-    // ✅ SUPER SIMPLE - Hardcoded credentials
     const ADMIN_EMAIL = 'admin@growmart.com';
     const ADMIN_PASSWORD = 'growmart2025';
     
     if (email === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
-      // Generate token
       const token = jwt.sign(
-        { 
-          email: ADMIN_EMAIL,
-          isAdmin: true,
-          role: 'admin'
-        }, 
-        process.env.JWT_SECRET, 
+        { email: ADMIN_EMAIL, isAdmin: true, role: 'admin' },
+        process.env.JWT_SECRET,
         { expiresIn: '24h' }
       );
 
